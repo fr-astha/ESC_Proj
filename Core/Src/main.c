@@ -40,12 +40,14 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 
 #define MAX_TASKS   4
-#define STACK_SIZE  512   // 256 words = 1024 bytes per task
+#define STACK_SIZE  512   // 256 words = 2048 bytes per task
 
 typedef enum {
     TASK_READY = 0,
@@ -67,6 +69,34 @@ uint8_t  current_task_id = 0;
 volatile uint32_t sys_ticks = 0;          // incremented by our own SysTick
 volatile uint8_t  scheduler_running = 0;
 volatile uint32_t count_high = 0, count_mid = 0, count_low = 0;
+volatile uint32_t echo_start = 0;
+volatile uint32_t echo_width_cycles = 0;
+volatile uint8_t  echo_done = 0;
+volatile uint32_t distance_cm = 999;     // 999 = nothing in range
+volatile uint8_t  obstacle_near = 0;
+volatile uint32_t exti_count = 0;
+volatile uint32_t deadline_misses = 0;
+volatile uint32_t imu_count   = 0;
+volatile uint32_t imu_min_us  = 0xFFFFFFFF;
+volatile uint32_t imu_max_us  = 0;
+volatile int32_t ax_mg = 0, ay_mg = 0, az_mg = 0;   // milli-g
+volatile int32_t gz_dps_x10 = 0;                    // tenths of deg/s
+volatile uint32_t imu_read_max_us = 0;              // slowest I2C read
+#define SKID_ON_DPS_X10   300     // 30.0 deg/s
+#define SKID_OFF_DPS_X10  200     // 20.0 deg/s
+#define SKID_ON_SAMPLES   5       // 5 x 2 ms  = 10 ms
+#define SKID_OFF_SAMPLES  25      // 25 x 2 ms = 50 ms
+
+volatile int32_t  expected_yaw_x10 = 0;   // will come from the motor commands later
+volatile uint8_t  skid_flag   = 0;
+volatile uint32_t skid_events = 0;
+volatile uint32_t i2c_errors = 0;
+volatile uint32_t mpu_reinits = 0;
+#define IMU_STALE_MS 20            // no good read for 20 ms = data is stale
+volatile uint32_t imu_last_ok_tick = 0;
+volatile uint8_t  imu_valid = 0;
+int32_t ax_off = 0, ay_off = 0, gz_off = 0;   // raw-count offsets from calibration
+
 
 /* USER CODE END PV */
 
@@ -74,13 +104,143 @@ volatile uint32_t count_high = 0, count_mid = 0, count_low = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void delay_us(uint32_t us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = us * 72;            // 72 cycles per microsecond
+    while ((DWT->CYCCNT - start) < ticks);
+}
+// Frees a bus where the sensor is holding SDA low, then restarts I2C1
+static void i2c_bus_recover(void)
+{
+    HAL_I2C_DeInit(&hi2c1);
 
+    GPIO_InitTypeDef g = {0};
+    g.Pin   = GPIO_PIN_6 | GPIO_PIN_7;           // PB6 = SCL, PB7 = SDA
+    g.Mode  = GPIO_MODE_OUTPUT_OD;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOB, &g);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);
+    delay_us(10);
+    for (int i = 0; i < 9; i++) {                // clock out a stuck slave
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); delay_us(10);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   delay_us(10);
+    }
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET); delay_us(10);   // STOP
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   delay_us(10);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   delay_us(10);
+
+    HAL_I2C_Init(&hi2c1);                        // restores the I2C pin setup
+}
+
+#define MPU_ADDR (0x68 << 1)
+static int mpu_write_verify(uint8_t reg, uint8_t val)
+{
+    for (int i = 0; i < 5; i++) {
+        uint8_t rb = 0xFF;
+        if (HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &val, 1, 10) == HAL_OK &&
+            HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &rb, 1, 10) == HAL_OK &&
+            rb == val)
+            return 1;                      // written and read back correctly
+        HAL_Delay(10);
+    }
+    return 0;
+}
+
+// returns 1 if every setting was written and verified
+static int mpu_init(void)
+{
+    int ok = 1;
+    ok &= mpu_write_verify(0x6B, 0x00);    // wake up
+    HAL_Delay(100);
+    ok &= mpu_write_verify(0x1A, 0x03);    // low-pass filter ~44 Hz
+    ok &= mpu_write_verify(0x1B, 0x08);    // gyro  +-500 deg/s
+    ok &= mpu_write_verify(0x1C, 0x08);    // accel +-4 g
+    return ok;
+}
+
+static uint8_t i2c_fail_streak = 0;
+static uint8_t i2c_skip = 0;
+
+// Reads raw values. Returns 1 on success, 0 on I2C error.
+static int mpu_read_raw(int16_t *ax, int16_t *ay, int16_t *az, int16_t *gz)
+{
+    uint8_t r[14];
+
+    if (i2c_skip) { i2c_skip--; return 0; }      // backing off, give others CPU time
+    if (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY)) {   // bus stuck: don't wait 25 ms
+        i2c_errors++;
+        i2c_bus_recover();
+        i2c_skip = 5;
+        return 0;
+    }
+
+    if (HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, 0x3B, I2C_MEMADD_SIZE_8BIT, r, 14, 3) != HAL_OK) {
+        i2c_errors++;
+        if (++i2c_fail_streak >= 3) {
+            i2c_bus_recover();
+            i2c_fail_streak = 0;
+            i2c_skip = 25;                       // pause about 50 ms
+        }
+        return 0;
+    }
+    i2c_fail_streak = 0;
+
+    *ax = (int16_t)((r[0]  << 8) | r[1]);
+    *ay = (int16_t)((r[2]  << 8) | r[3]);
+    *az = (int16_t)((r[4]  << 8) | r[5]);
+    *gz = (int16_t)((r[12] << 8) | r[13]);
+    return 1;
+}
+
+static int mpu_reconfig(void)
+{
+    int ok = 1;
+    ok &= mpu_write_verify(0x6B, 0x00);
+    ok &= mpu_write_verify(0x1A, 0x03);
+    ok &= mpu_write_verify(0x1B, 0x08);
+    ok &= mpu_write_verify(0x1C, 0x08);
+    return ok;
+}
+
+// If the sensor forgot its settings (power glitch), put them back.
+static void mpu_check_config(void)
+{
+    uint8_t v = 0xFF;
+    if (HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, 0x1C, I2C_MEMADD_SIZE_8BIT, &v, 1, 3) == HAL_OK
+        && v != 0x08) {
+        if (mpu_reconfig()) mpu_reinits++;
+    }
+}
+
+// Board must be still. Averages 500 samples (~1 s).
+static int mpu_calibrate(void)
+{
+    int32_t sax = 0, say = 0, sgz = 0;
+    int good = 0;
+    for (int i = 0; i < 500; i++) {
+        int16_t ax, ay, az, gz;
+        if (mpu_read_raw(&ax, &ay, &az, &gz)) {
+            sax += ax; say += ay; sgz += gz; good++;
+        }
+        HAL_Delay(2);
+    }
+    if (good > 0) {
+        ax_off = sax / good;
+        ay_off = say / good;
+        gz_off = sgz / good;
+    }
+    return good;
+}
 static void Task_Exit_Trap(void)
 {
     while (1);   // a task should never return; if it does, we get stuck here
@@ -129,7 +289,34 @@ void Task_Delay(uint32_t ticks)
     __DSB();
     __ISB();
 }
+// Sleep until (lastWake + period). Keeps a fixed rhythm with no drift.
+// Sleep until (lastWake + period). Keeps a fixed rhythm with no drift.
+void Task_DelayUntil(uint32_t *lastWake, uint32_t period)
+{
+    __disable_irq();
+    uint32_t next = *lastWake + period;
+    int32_t  wait = (int32_t)(next - sys_ticks);
 
+    if (wait < 0) {                        // deadline missed
+        deadline_misses++;
+        *lastWake = sys_ticks + 1;         // resync
+        wait = 1;                          // still yield 1 tick so others can run
+    } else if (wait == 0) {                // exactly on time: keep going
+        *lastWake = next;
+        __enable_irq();
+        return;
+    } else {
+        *lastWake = next;
+    }
+
+    TCB_Table[current_task_id].delayTicks = (uint32_t)wait;
+    TCB_Table[current_task_id].state      = TASK_BLOCKED;
+    __enable_irq();
+
+    SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
+    __DSB();
+    __ISB();
+}
 // Called every 1 ms from SysTick: wake sleepers, then ask for a re-evaluation
 void Scheduler_Tick(void)
 {
@@ -170,39 +357,121 @@ uint32_t *Scheduler_Switch(uint32_t *oldSp)
     return sp;
 }
 
-// ---- Test tasks ----
-void Task_High(void)    // priority 0: wakes every 250 ms
+void Task_IMU(void)   // priority 0: every 2 ms
 {
+    uint32_t last = sys_ticks;
+    uint32_t prev = 0;
+    uint8_t  started = 0;
+    uint8_t  on_cnt = 0, off_cnt = 0;
+    uint8_t chk=0;
+    imu_last_ok_tick = sys_ticks;
+
     while (1) {
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-        count_high++;
-        Task_Delay(250);
+        uint32_t now = DWT->CYCCNT;
+        if (started) {
+            uint32_t period_us = (now - prev) / 72;
+            if (period_us < imu_min_us) imu_min_us = period_us;
+            if (period_us > imu_max_us) imu_max_us = period_us;
+        }
+        prev = now;
+        started = 1;
+        imu_count++;
+
+        if (++chk >= 50) { chk = 0; mpu_check_config(); }   // every 100 ms
+
+        int16_t ax, ay, az, gz;
+        uint32_t t0 = DWT->CYCCNT;
+        int ok = mpu_read_raw(&ax, &ay, &az, &gz);
+        uint32_t dur_us = (DWT->CYCCNT - t0) / 72;
+        if (dur_us > imu_read_max_us) imu_read_max_us = dur_us;
+
+        if (ok) {
+            imu_last_ok_tick = sys_ticks;
+            ax_mg      = ((int32_t)ax - ax_off) * 1000 / 8192;
+            ay_mg      = ((int32_t)ay - ay_off) * 1000 / 8192;
+            az_mg      = (int32_t)az * 1000 / 8192;          // not calibrated: ~1000 when flat
+            gz_dps_x10 = ((int32_t)gz - gz_off) * 100 / 655; // 65.5 LSB per deg/s
+            int32_t diff = gz_dps_x10 - expected_yaw_x10;
+            if (diff < 0) diff = -diff;
+
+
+            if (!skid_flag) {
+                if (diff > SKID_ON_DPS_X10) {
+                    if (++on_cnt >= SKID_ON_SAMPLES) {
+                        skid_flag = 1;
+                        skid_events++;
+                        off_cnt = 0;
+                    }
+                } else {
+                    on_cnt = 0;
+                }
+            } else {
+                if (diff < SKID_OFF_DPS_X10) {
+                    if (++off_cnt >= SKID_OFF_SAMPLES) {
+                        skid_flag = 0;
+                        on_cnt = 0;
+                    }
+                } else {
+                    off_cnt = 0;
+                }
+            }
+        }
+        imu_valid = ((sys_ticks - imu_last_ok_tick) <= IMU_STALE_MS);
+        if (!imu_valid) { on_cnt = 0; off_cnt = 0; }   // don't count skid samples on stale data
+
+        Task_DelayUntil(&last, 2);
+    }
+}
+void Task_Ultrasonic(void)   // priority 1: every 20 ms
+{
+    uint32_t last = sys_ticks;
+    while (1) {
+        echo_done = 0;
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);    // 10 us trigger pulse
+        delay_us(10);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+
+        Task_DelayUntil(&last, 20);                            // echo arrives meanwhile
+
+        uint32_t width_us = echo_width_cycles / 72;
+        if (echo_done && width_us < 25000)
+            distance_cm = width_us / 58;
+        else
+            distance_cm = 999;                                 // nothing in range
+
+        obstacle_near = (distance_cm < 20);
     }
 }
 
-void Task_Mid(void)     // priority 1: wakes every 1000 ms
-{
-    while (1) {
-        count_mid++;
-        Task_Delay(1000);
-    }
-}
-
-char tx_buf[96];
+char tx_buf[160];
 
 void Task_Telemetry(void)   // priority 2: every 100 ms
 {
+    uint32_t last = sys_ticks;
     while (1) {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);   // heartbeat
+
         int n = snprintf(tx_buf, sizeof(tx_buf),
-                         "t=%lu ms  high=%lu  mid=%lu\r\n",
+                         "t=%lu dist=%lu imu=%lu jit[%lu..%lu] rd=%luus gz=%ld ay=%ld az=%ld err=%lu  miss=%lu skid=%u ev=%lu rst=%lu v=%u\r\n",
                          (unsigned long)sys_ticks,
-                         (unsigned long)count_high,
-                         (unsigned long)count_mid);
+                         (unsigned long)distance_cm,
+                         (unsigned long)imu_count,
+                         (unsigned long)imu_min_us,
+                         (unsigned long)imu_max_us,
+                         (unsigned long)imu_read_max_us,
+                         (long)gz_dps_x10,
+                         (long)ay_mg,
+                         (long)az_mg,
+                         (unsigned long)i2c_errors,
+                         (unsigned long)deadline_misses,
+                         (unsigned)skid_flag,
+                         (unsigned long)skid_events,
+                         (unsigned long)mpu_reinits,
+                         (unsigned)imu_valid);
         HAL_UART_Transmit(&huart1, (uint8_t *)tx_buf, (uint16_t)n, 50);
-        Task_Delay(100);
+        Task_DelayUntil(&last, 100);
     }
 }
-
 void Task_Idle(void)    // priority 3: runs only if nothing else can
 {
     while (1) { }
@@ -279,12 +548,36 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
-  SysTick_Config(SystemCoreClock / 1000);   // SysTick fires every 1 ms
-  Task_Init(0, Task_High, 0);
-  Task_Init(1, Task_Mid,  1);
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    HAL_Delay(300);
+    int init_ok = 0;
+    for (int tries = 0; tries < 5 && !init_ok; tries++) {
+        if (tries) i2c_bus_recover();    // unstick the bus before retrying
+        init_ok = mpu_init();
+    }
+    HAL_Delay(500);                      // keep the board still
+    int good = 0;
+    for (int tries = 0; tries < 3 && good < 450; tries++)
+        good = mpu_calibrate();
+    {
+        char b[120];
+        int n = snprintf(b, sizeof(b),
+                         "CAL init=%d good=%d ax_off=%ld ay_off=%ld gz_off=%ld errs=%lu\r\n",
+                         init_ok, good, (long)ax_off, (long)ay_off, (long)gz_off,
+                         (unsigned long)i2c_errors);
+        HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)n, 100);
+    }
+    i2c_errors = 0;                      // from here on, count only runtime errors
+
+  SysTick_Config(SystemCoreClock / 1000);
+  Task_Init(0, Task_IMU,       0);
+  Task_Init(1, Task_Ultrasonic, 1);
   Task_Init(2, Task_Telemetry,  2);
-  Task_Init(3, Task_Idle, 3);
+  Task_Init(3, Task_Idle,       3);
   Scheduler_Start();
 
   /* USER CODE END 2 */
@@ -341,6 +634,40 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -388,10 +715,14 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -400,12 +731,41 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PB0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_1) {
+    	   exti_count++;
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_SET)
+            echo_start = DWT->CYCCNT;                          // rising edge
+        else {
+            echo_width_cycles = DWT->CYCCNT - echo_start;      // falling edge
+            echo_done = 1;
+        }
+    }
+}
 
 /* USER CODE END 4 */
 
