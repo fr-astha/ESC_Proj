@@ -145,6 +145,4 @@ The sensors are real; the car physics are deliberately simple (a speed ramp plus
 - Baseline (super-loop) vs. scheduler jitter and latency comparison logged to CSV
 - Optional: TB6612FNG motor driver output on TIM3 PWM
 
-## License
 
-Add your license here (for example MIT).
