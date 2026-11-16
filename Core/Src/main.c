@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
    #include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,6 +42,8 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
+
+TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart1;
 
@@ -97,6 +100,23 @@ volatile uint32_t imu_last_ok_tick = 0;
 volatile uint8_t  imu_valid = 0;
 int32_t ax_off = 0, ay_off = 0, gz_off = 0;   // raw-count offsets from calibration
 
+// ---- virtual skid correction (no motors: outputs go to telemetry/dashboard) ----
+#define BASE_SPEED_PCT      60     // commanded straight-line speed
+#define KP_DIV              10     // correction % = yaw error (0.1 deg/s units) / 10
+#define CORR_MAX_PCT        40
+#define CORR_DEADBAND_X10   50     // ignore yaw errors under 5.0 deg/s
+#define SKID_THROTTLE_PCT   50     // while skidding, speed is cut to 50%
+
+volatile int32_t cmd_left = 0, cmd_right = 0;   // virtual wheel commands, 0..100 %
+volatile uint8_t  rx_byte;
+static char       rx_line[24];
+static uint8_t    rx_len = 0;
+volatile int32_t  tgt_speed_pct = 0;     // set from the PC
+volatile int32_t  accel_cms2    = 120;   // set from the PC
+volatile uint32_t rx_cmds       = 0;     // count of valid commands received
+volatile int32_t corr_pct = 0;                  // steering correction applied
+volatile uint8_t ctrl_state = 0;   // 0 run, 1 skid (throttle cut), 2 obstacle stop, 3 sensor fault stop
+
 
 /* USER CODE END PV */
 
@@ -105,6 +125,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -241,6 +262,37 @@ static int mpu_calibrate(void)
     }
     return good;
 }
+
+#define PWM_MAX          3599     // TIM3 period (ARR) from CubeMX
+#define MOTOR_LIMIT_PCT  50       // duty cap until we know the motors' rated voltage
+
+// ch 0 = left (A), ch 1 = right (B).  speed: -100 .. +100 (%)
+static void motor_set(int ch, int speed)
+{
+    if (speed > 100)  speed = 100;
+    if (speed < -100) speed = -100;
+
+    uint32_t mag  = (uint32_t)(speed < 0 ? -speed : speed);
+    uint32_t duty = mag * MOTOR_LIMIT_PCT * PWM_MAX / 10000;
+    GPIO_PinState in1 = (speed > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+    GPIO_PinState in2 = (speed < 0) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+
+    if (ch == 0) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, in1);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, in2);
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, duty);
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, in1);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, in2);
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, duty);
+    }
+}
+
+static void motors_enable(int on)       // STBY pin on PA4
+{
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
 static void Task_Exit_Trap(void)
 {
     while (1);   // a task should never return; if it does, we get stuck here
@@ -357,6 +409,59 @@ uint32_t *Scheduler_Switch(uint32_t *oldSp)
     return sp;
 }
 
+static void control_update(void)
+{
+    int32_t base = BASE_SPEED_PCT;
+
+    if (!imu_valid) {                      // can't trust the sensor: fail-safe stop
+        ctrl_state = 3; cmd_left = 0; cmd_right = 0; corr_pct = 0;
+        return;
+    }
+    if (obstacle_near) {                   // obstacle: stop
+        ctrl_state = 2; cmd_left = 0; cmd_right = 0; corr_pct = 0;
+        return;
+    }
+    if (skid_flag) { base = base * SKID_THROTTLE_PCT / 100; ctrl_state = 1; }
+    else           { ctrl_state = 0; }
+
+    // error > 0 means the car should turn more counter-clockwise
+    int32_t err = expected_yaw_x10 - gz_dps_x10;
+    int32_t c = 0;
+    if (err > CORR_DEADBAND_X10 || err < -CORR_DEADBAND_X10) c = err / KP_DIV;
+    if (c >  CORR_MAX_PCT) c =  CORR_MAX_PCT;
+    if (c < -CORR_MAX_PCT) c = -CORR_MAX_PCT;
+    corr_pct = c;
+
+    int32_t l = base - c;                  // counter-clockwise turn = right wheel faster
+    int32_t r = base + c;
+    if (l < 0)   l = 0;
+    if (l > 100) l = 100;
+    if (r < 0)   r = 0;
+    if (r > 100) r = 100;
+    cmd_left  = l;
+    cmd_right = r;
+}
+
+#define BRAKE_CMS2  400
+volatile int32_t car_speed_mcms = 0;     // speed in 1/1000 cm/s
+
+static void speed_update(void)           // called every 2 ms
+{
+    int32_t target = tgt_speed_pct * 1000;               // 100 % = 100 cm/s
+    if (ctrl_state == 1)       target = target * SKID_THROTTLE_PCT / 100;
+    else if (ctrl_state >= 2)  target = 0;                // obstacle or sensor fault
+
+    if (target > car_speed_mcms)
+    {
+        car_speed_mcms += accel_cms2 * 2;                 // accel * 2 ms
+        if (car_speed_mcms > target) car_speed_mcms = target;
+    }
+    else
+    {
+        car_speed_mcms -= BRAKE_CMS2 * 2;
+        if (car_speed_mcms < target) car_speed_mcms = target;
+    }
+}
 void Task_IMU(void)   // priority 0: every 2 ms
 {
     uint32_t last = sys_ticks;
@@ -418,6 +523,8 @@ void Task_IMU(void)   // priority 0: every 2 ms
         }
         imu_valid = ((sys_ticks - imu_last_ok_tick) <= IMU_STALE_MS);
         if (!imu_valid) { on_cnt = 0; off_cnt = 0; }   // don't count skid samples on stale data
+        control_update();
+        speed_update();
 
         Task_DelayUntil(&last, 2);
     }
@@ -443,7 +550,7 @@ void Task_Ultrasonic(void)   // priority 1: every 20 ms
     }
 }
 
-char tx_buf[160];
+char tx_buf[240];
 
 void Task_Telemetry(void)   // priority 2: every 100 ms
 {
@@ -452,7 +559,7 @@ void Task_Telemetry(void)   // priority 2: every 100 ms
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);   // heartbeat
 
         int n = snprintf(tx_buf, sizeof(tx_buf),
-                         "t=%lu dist=%lu imu=%lu jit[%lu..%lu] rd=%luus gz=%ld ay=%ld az=%ld err=%lu  miss=%lu skid=%u ev=%lu rst=%lu v=%u\r\n",
+                         "t=%lu dist=%lu imu=%lu jit[%lu..%lu] rd=%luus gz=%ld ay=%ld az=%ld err=%lu  miss=%lu skid=%u ev=%lu  rst=%lu v=%u L=%ld R=%ld c=%ld st=%u tg=%ld ac=%ld rx=%lu sp=%ld\r\n",
                          (unsigned long)sys_ticks,
                          (unsigned long)distance_cm,
                          (unsigned long)imu_count,
@@ -467,7 +574,16 @@ void Task_Telemetry(void)   // priority 2: every 100 ms
                          (unsigned)skid_flag,
                          (unsigned long)skid_events,
                          (unsigned long)mpu_reinits,
-                         (unsigned)imu_valid);
+                         (unsigned)imu_valid,
+
+                         (long)cmd_left,
+                         (long)cmd_right,
+                         (long)corr_pct,
+                         (unsigned)ctrl_state,
+						 (long)tgt_speed_pct,
+						 (long)accel_cms2,
+						 (unsigned long)rx_cmds,
+						 (long)(car_speed_mcms / 1000));
         HAL_UART_Transmit(&huart1, (uint8_t *)tx_buf, (uint16_t)n, 50);
         Task_DelayUntil(&last, 100);
     }
@@ -549,6 +665,7 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_I2C1_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
@@ -573,6 +690,32 @@ int main(void)
     }
     i2c_errors = 0;                      // from here on, count only runtime errors
 
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    motor_set(0, 0);
+    motor_set(1, 0);
+
+    // ---- temporary motor test (remove after it passes) ----
+    {
+        const char *m = "MOTOR TEST in 5 s - wheels off the ground!\r\n";
+        HAL_UART_Transmit(&huart1, (uint8_t *)m, strlen(m), 100);
+        HAL_Delay(5000);
+
+        motors_enable(1);
+        for (int ch = 0; ch < 2; ch++) {
+            motor_set(ch, 50);   HAL_Delay(1000);    // forward
+            motor_set(ch, 0);    HAL_Delay(500);
+            motor_set(ch, -50);  HAL_Delay(1000);    // reverse
+            motor_set(ch, 0);    HAL_Delay(500);
+        }
+        motor_set(0, 50); motor_set(1, 50); HAL_Delay(1000);   // both forward
+        motor_set(0, 0);  motor_set(1, 0);
+        motors_enable(0);
+        m = "MOTOR TEST done\r\n";
+        HAL_UART_Transmit(&huart1, (uint8_t *)m, strlen(m), 100);
+    }
+
+  HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
   SysTick_Config(SystemCoreClock / 1000);
   Task_Init(0, Task_IMU,       0);
   Task_Init(1, Task_Ultrasonic, 1);
@@ -668,6 +811,59 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 3599;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -715,14 +911,18 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14
+                          |GPIO_PIN_15, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -731,8 +931,17 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB0 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  /*Configure GPIO pin : PA4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB0 PB12 PB13 PB14
+                           PB15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14
+                          |GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -767,6 +976,51 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     }
 }
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        char c = (char)rx_byte;
+        if (c == '\n' || c == '\r')
+        {
+            if (rx_len > 0)
+            {
+                rx_line[rx_len] = 0;
+                // expected format: S<speed>,<accel>   e.g. S80,200
+                if (rx_line[0] == 'S')
+                {
+                    int32_t a = 0, b = 0;
+                    uint8_t i = 1;
+                    while (rx_line[i] >= '0' && rx_line[i] <= '9') { a = a * 10 + (rx_line[i] - '0'); i++; }
+                    if (rx_line[i] == ',')
+                    {
+                        i++;
+                        while (rx_line[i] >= '0' && rx_line[i] <= '9') { b = b * 10 + (rx_line[i] - '0'); i++; }
+                        if (rx_line[i] == 0 && a <= 100 && b >= 20 && b <= 300)
+                        {
+                            tgt_speed_pct = a;
+                            accel_cms2 = b;
+                            rx_cmds++;
+                        }
+                    }
+                }
+                rx_len = 0;
+            }
+        }
+        else if (rx_len < sizeof(rx_line) - 1) { rx_line[rx_len++] = c; }
+        else { rx_len = 0; }
+        HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        rx_len = 0;
+        HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
+    }
+}
 /* USER CODE END 4 */
 
 /**
